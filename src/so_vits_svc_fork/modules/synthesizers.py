@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 import so_vits_svc_fork.f0
+from so_vits_svc_fork.utils import repeat_expand_2d
 from so_vits_svc_fork.f0 import f0_to_coarse
 from so_vits_svc_fork.modules import commons as commons
 from so_vits_svc_fork.modules.decoders.f0 import F0Decoder
@@ -16,6 +17,9 @@ from so_vits_svc_fork.modules.decoders.mb_istft import (
     iSTFT_Generator,
 )
 from so_vits_svc_fork.modules.encoders import Encoder, TextEncoder
+from so_vits_svc_fork.modules.ssl_feature_extractors import (
+    HubertFeatureExtractor
+)
 from so_vits_svc_fork.modules.flows import ResidualCouplingBlock
 
 LOG = getLogger(__name__)
@@ -77,10 +81,18 @@ class SynthesizerTrn(nn.Module):
         self.gen_istft_n_fft = gen_istft_n_fft
         self.gen_istft_hop_size = gen_istft_hop_size
         self.subbands = subbands
-        if kwargs:
-            warnings.warn(f"Unused arguments: {kwargs}")
 
         self.emb_g = nn.Embedding(n_speakers, gin_channels)
+
+        if kwargs["ssl_encoder_type"] == "hubert":
+            LOG.info(f"Loading HuBERT from {kwargs['ssl_encoder_path']}")
+            self.ssl_model = HubertFeatureExtractor(
+                kwargs["ssl_encoder_path"], 
+                svc_model_sr=sampling_rate,
+                legacy_final_proj=kwargs["contentvec_final_proj"],
+            )
+        else:
+            self.ssl_model = None
 
         if ssl_dim is None:
             self.pre = nn.LazyConv1d(hidden_channels, kernel_size=5, padding=2)
@@ -163,7 +175,21 @@ class SynthesizerTrn(nn.Module):
         )
         self.emb_uv = nn.Embedding(2, hidden_channels)
 
-    def forward(self, c, f0, uv, spec, g=None, c_lengths=None, spec_lengths=None):
+    def forward(self, f0, uv, spec, g=None, c_lengths=None, spec_lengths=None, c=None, y=None):
+
+        if c is None:
+            if self.ssl_model is None:
+                raise ValueError("c is None and ssl_model is also None")
+            if y is None:
+                raise ValueError("c is None and y is also None")
+            c = self.ssl_model.extract_features(y)
+
+        if c.size(2) < f0.size(1):
+            c = torch.nn.functional.interpolate( 
+                c.unsqueeze(0),
+                size=[c.size(1), f0.size(1)], 
+                mode="nearest").squeeze(0)
+    
         g = self.emb_g(g).transpose(1, 2)
         # ssl prenet
         x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(
@@ -204,7 +230,22 @@ class SynthesizerTrn(nn.Module):
             lf0,
         )
 
-    def infer(self, c, f0, uv, g=None, noice_scale=0.35, predict_f0=False):
+    def infer(self, f0, uv, g=None, c=None, y=None, noice_scale=0.35, predict_f0=False):
+        
+        if c is None:
+            if self.ssl_model is None:
+                raise ValueError("c is None and ssl_model is also None")
+            if y is None:
+                raise ValueError("c is None and y is also None")
+            with torch.no_grad():
+                c = self.ssl_model.extract_features(y)
+            
+            if c.size(2) != f0.size(1):
+                c = torch.nn.functional.interpolate( 
+                    c.unsqueeze(0),
+                    size=[c.size(1), f0.size(1)], 
+                    mode="nearest").squeeze(0)
+                
         c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
         g = self.emb_g(g).transpose(1, 2)
         x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(

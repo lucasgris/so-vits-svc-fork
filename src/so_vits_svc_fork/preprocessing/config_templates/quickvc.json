@@ -43,6 +43,8 @@
     "contentvec_final_proj": false
   },
   "model": {
+    "ssl_encoder_type": "hubert",
+    "ssl_encoder_path": "lengyue233/content-vec-best",
     "inter_channels": 192,
     "hidden_channels": 192,
     "filter_channels": 768,
