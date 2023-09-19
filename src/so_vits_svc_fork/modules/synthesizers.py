@@ -20,7 +20,10 @@ from so_vits_svc_fork.modules.encoders import Encoder, TextEncoder
 from so_vits_svc_fork.modules.ssl_feature_extractors import (
     HubertFeatureExtractor
 )
-from so_vits_svc_fork.modules.flows import ResidualCouplingBlock
+from so_vits_svc_fork.modules.flows import (
+    ResidualCouplingBlock,
+    ResidualCouplingTransformersBlock
+)
 
 LOG = getLogger(__name__)
 
@@ -51,10 +54,14 @@ class SynthesizerTrn(nn.Module):
         ssl_dim: int,
         n_speakers: int,
         sampling_rate: int = 44100,
-        type_: Literal["hifi-gan", "istft", "ms-istft", "mb-istft"] = "hifi-gan",
+        type_: Literal["hifi-gan", "istft",
+                       "ms-istft", "mb-istft"] = "hifi-gan",
         gen_istft_n_fft: int = 16,
         gen_istft_hop_size: int = 4,
         subbands: int = 4,
+        use_transformer_flows=True,
+        transformer_flow_type: Literal["pre_conv",
+                                       "fft", "mono_layer"] = 'mono_layer',
         **kwargs: Any,
     ):
         super().__init__()
@@ -81,13 +88,25 @@ class SynthesizerTrn(nn.Module):
         self.gen_istft_n_fft = gen_istft_n_fft
         self.gen_istft_hop_size = gen_istft_hop_size
         self.subbands = subbands
+        self.use_transformer_flows = use_transformer_flows
+        self.transformer_flow_type = transformer_flow_type
+
+        self.use_noise_scaled_mas = kwargs.get("use_noise_scaled_mas", False)
+        self.mas_noise_scale_initial = kwargs.get(
+            "mas_noise_scale_initial", 0.01)
+        self.noise_scale_delta = kwargs.get("noise_scale_delta", 2e-6)
+        self.current_mas_noise_scale = self.mas_noise_scale_initial
+
+        if self.use_transformer_flows:
+            assert self.transformer_flow_type in [
+                "pre_conv", "fft", "mono_layer"], "transformer_flow_type must be one of ['pre_conv', 'fft','mono_layer']"
 
         self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
         if kwargs["ssl_encoder_type"] == "hubert":
             LOG.info(f"Loading HuBERT from {kwargs['ssl_encoder_path']}")
             self.ssl_model = HubertFeatureExtractor(
-                kwargs["ssl_encoder_path"], 
+                kwargs["ssl_encoder_path"],
                 svc_model_sr=sampling_rate,
                 legacy_final_proj=kwargs["contentvec_final_proj"],
             )
@@ -97,7 +116,8 @@ class SynthesizerTrn(nn.Module):
         if ssl_dim is None:
             self.pre = nn.LazyConv1d(hidden_channels, kernel_size=5, padding=2)
         else:
-            self.pre = nn.Conv1d(ssl_dim, hidden_channels, kernel_size=5, padding=2)
+            self.pre = nn.Conv1d(ssl_dim, hidden_channels,
+                                 kernel_size=5, padding=2)
 
         self.enc_p = TextEncoder(
             inter_channels,
@@ -160,9 +180,27 @@ class SynthesizerTrn(nn.Module):
             16,
             gin_channels=gin_channels,
         )
-        self.flow = ResidualCouplingBlock(
-            inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels
-        )
+        if self.use_transformer_flows:
+            self.flow = ResidualCouplingTransformersBlock(
+                inter_channels,
+                hidden_channels,
+                5,
+                1,
+                4,
+                gin_channels=gin_channels,
+                use_transformer_flows=self.use_transformer_flows,
+                transformer_flow_type=self.transformer_flow_type
+            )
+        else:
+            self.flow = ResidualCouplingBlock(
+                inter_channels, 
+                hidden_channels, 
+                5, 
+                1, 
+                4, 
+                gin_channels=gin_channels
+            )
+
         self.f0_decoder = F0Decoder(
             1,
             hidden_channels,
@@ -185,11 +223,11 @@ class SynthesizerTrn(nn.Module):
             c = self.ssl_model.extract_features(y)
 
         if c.size(2) < f0.size(1):
-            c = torch.nn.functional.interpolate( 
+            c = torch.nn.functional.interpolate(
                 c.unsqueeze(0),
-                size=[c.size(1), f0.size(1)], 
+                size=[c.size(1), f0.size(1)],
                 mode="nearest").squeeze(0)
-    
+
         g = self.emb_g(g).transpose(1, 2)
         # ssl prenet
         x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(
@@ -231,7 +269,7 @@ class SynthesizerTrn(nn.Module):
         )
 
     def infer(self, f0, uv, g=None, c=None, y=None, noice_scale=0.35, predict_f0=False):
-        
+
         if c is None:
             if self.ssl_model is None:
                 raise ValueError("c is None and ssl_model is also None")
@@ -239,13 +277,13 @@ class SynthesizerTrn(nn.Module):
                 raise ValueError("c is None and y is also None")
             with torch.no_grad():
                 c = self.ssl_model.extract_features(y)
-            
+
             if c.size(2) != f0.size(1):
-                c = torch.nn.functional.interpolate( 
+                c = torch.nn.functional.interpolate(
                     c.unsqueeze(0),
-                    size=[c.size(1), f0.size(1)], 
+                    size=[c.size(1), f0.size(1)],
                     mode="nearest").squeeze(0)
-                
+
         c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
         g = self.emb_g(g).transpose(1, 2)
         x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(

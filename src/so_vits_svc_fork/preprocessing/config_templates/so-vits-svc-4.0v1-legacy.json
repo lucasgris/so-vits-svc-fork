@@ -38,6 +38,8 @@
     "mel_fmax": 22050
   },
   "model": {
+    "use_transformer_flows": true,
+    "transformer_flow_type": "pre_conv",
     "ssl_encoder_type": "hubert",
     "ssl_encoder_path": "lengyue233/content-vec-best",
     "inter_channels": 192,
